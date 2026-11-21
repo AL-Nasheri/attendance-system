@@ -1,0 +1,202 @@
+import secrets
+from datetime import date, datetime
+from zoneinfo import ZoneInfo
+
+from fastapi import APIRouter, Depends, HTTPException, Response
+from pydantic import BaseModel, Field
+from sqlalchemy import delete, func, select, update
+from sqlalchemy.orm import Session
+
+from app.auth import current_doctor
+from app.codes import current_code, refresh_running
+from app.db import get_db
+from app.models import Attendance, CodeAttempt, Doctor, Lecture
+
+router = APIRouter(prefix="/api/lectures")
+
+YEMEN_TZ = ZoneInfo("Asia/Aden")
+
+MSG_NOT_FOUND = "المحاضرة غير موجودة"
+STATUS_PRESENT = "حاضر"
+
+
+def yemen_today() -> date:
+    return datetime.now(YEMEN_TZ).date()
+
+
+class LectureIn(BaseModel):
+    name: str = Field(max_length=200)
+    lecture_time: str | None = Field(default=None, max_length=20)
+    major: str = Field(default="", max_length=200)
+
+
+def lecture_out(lec: Lecture) -> dict:
+    return {
+        "id": lec.id,
+        "name": lec.name,
+        "lecture_date": lec.lecture_date.isoformat(),
+        "lecture_time": lec.lecture_time,
+        "major": lec.major,
+        "is_running": lec.is_running,
+    }
+
+
+def db_now(db: Session) -> datetime:
+    return db.scalar(select(func.now()))
+
+
+def get_own_lecture(db: Session, lecture_id: int, doctor: Doctor) -> Lecture:
+    lec = db.get(Lecture, lecture_id)
+    if lec is None or lec.doctor_id != doctor.id:
+        raise HTTPException(404, MSG_NOT_FOUND)
+    return lec
+
+
+@router.get("")
+def list_lectures(
+    doctor: Doctor = Depends(current_doctor), db: Session = Depends(get_db)
+):
+    rows = db.scalars(
+        select(Lecture)
+        .where(Lecture.doctor_id == doctor.id)
+        .order_by(Lecture.lecture_date.desc(), Lecture.id.desc())
+    ).all()
+    now = db_now(db)
+    for lec in rows:
+        refresh_running(lec, now)
+    db.commit()
+    return [lecture_out(lec) for lec in rows]
+
+
+@router.post("")
+def create_lecture(
+    body: LectureIn,
+    doctor: Doctor = Depends(current_doctor),
+    db: Session = Depends(get_db),
+):
+    name = body.name.strip()
+    if not name:
+        raise HTTPException(422, "اسم المحاضرة مطلوب")
+    time_text = (body.lecture_time or "").strip() or None
+    major = body.major.strip()
+    if not major:
+        raise HTTPException(422, "التخصص مطلوب")
+    lec = Lecture(
+        doctor_id=doctor.id,
+        name=name,
+        lecture_date=yemen_today(),
+        lecture_time=time_text,
+        major=major,
+        code_secret=secrets.token_hex(32),
+        is_running=False,
+    )
+    db.add(lec)
+    db.commit()
+    return lecture_out(lec)
+
+
+@router.delete("/{lecture_id}")
+def delete_lecture(
+    lecture_id: int,
+    doctor: Doctor = Depends(current_doctor),
+    db: Session = Depends(get_db),
+):
+    lec = get_own_lecture(db, lecture_id, doctor)
+    db.delete(lec)  # attendance and attempts are deleted with it (CASCADE)
+    db.commit()
+    return {"ok": True}
+
+
+@router.post("/{lecture_id}/start")
+def start_lecture(
+    lecture_id: int,
+    doctor: Doctor = Depends(current_doctor),
+    db: Session = Depends(get_db),
+):
+    """Start, or restart after a stop. The attendance list is kept."""
+    lec = get_own_lecture(db, lecture_id, doctor)
+    # Only one session runs at a time: starting this one stops any other.
+    db.execute(
+        update(Lecture)
+        .where(Lecture.doctor_id == doctor.id, Lecture.id != lec.id)
+        .where(Lecture.is_running.is_(True))
+        .values(is_running=False)
+    )
+    lec.is_running = True
+    lec.started_at = db_now(db)
+    lec.code_secret = secrets.token_hex(32)  # new code sequence on every start
+    # Code numbers restart from 0, so old wrong-code counters must not carry over.
+    db.execute(delete(CodeAttempt).where(CodeAttempt.lecture_id == lec.id))
+    db.commit()
+    return lecture_out(lec)
+
+
+@router.post("/{lecture_id}/stop")
+def stop_lecture(
+    lecture_id: int,
+    doctor: Doctor = Depends(current_doctor),
+    db: Session = Depends(get_db),
+):
+    lec = get_own_lecture(db, lecture_id, doctor)
+    lec.is_running = False
+    db.commit()
+    return lecture_out(lec)
+
+
+@router.get("/{lecture_id}/live")
+def live(
+    lecture_id: int,
+    doctor: Doctor = Depends(current_doctor),
+    db: Session = Depends(get_db),
+):
+    """The doctor's screen asks this every 5 seconds:
+    current code (only while running) and the attendance list."""
+    lec = get_own_lecture(db, lecture_id, doctor)
+    now = db_now(db)
+    running = refresh_running(lec, now)
+    db.commit()
+    rows = db.scalars(
+        select(Attendance)
+        .where(Attendance.lecture_id == lec.id)
+        .order_by(Attendance.id)
+    ).all()
+    return {
+        **lecture_out(lec),
+        "code": current_code(lec, now) if running else None,
+        "attendance": [
+            {
+                "id": a.id,
+                "name": a.name,
+                "student_id": a.student_id,
+                "major": a.major,
+                "status": STATUS_PRESENT,
+            }
+            for a in rows
+        ],
+    }
+
+
+@router.get("/{lecture_id}/pdf")
+def download_pdf(
+    lecture_id: int,
+    doctor: Doctor = Depends(current_doctor),
+    db: Session = Depends(get_db),
+):
+    from app.pdf import build_pdf, content_disposition, pdf_filename
+
+    lec = get_own_lecture(db, lecture_id, doctor)
+    rows = db.scalars(
+        select(Attendance)
+        .where(Attendance.lecture_id == lec.id)
+        .order_by(Attendance.id)
+    ).all()
+    date_text = lec.lecture_date.isoformat()
+    data = build_pdf(
+        lec.name, date_text, lec.lecture_time,
+        [(a.name, a.student_id, a.major) for a in rows],
+    )
+    return Response(
+        content=data,
+        media_type="application/pdf",
+        headers={"Content-Disposition": content_disposition(pdf_filename(lec.name, date_text))},
+    )

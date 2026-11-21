@@ -1,0 +1,73 @@
+<!DOCTYPE html>
+<html lang="ar" dir="rtl">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>إدخال الكود</title>
+  <link rel="stylesheet" href="/css/style.css">
+</head>
+<body>
+  <main class="page">
+    <div class="card">
+      <h1>أدخل كود الحضور</h1>
+      <form id="code-form" novalidate>
+        <label for="code">الكود (3 أرقام)</label>
+        <input id="code" name="code" maxlength="10" inputmode="numeric" autocomplete="one-time-code"
+               style="text-align:center; font-size:32px; letter-spacing:0.3em; direction:ltr" required>
+        <button type="submit" class="block" id="submit">تسجيل الحضور</button>
+      </form>
+      <button type="button" class="block secondary" id="back">رجوع لتعديل البيانات</button>
+      <button type="button" class="block secondary hidden" id="done-back">رجوع</button>
+      <div id="msg" class="msg" role="alert"></div>
+    </div>
+  </main>
+
+  <script src="/js/api.js"></script>
+  <script>
+    let student = null;
+    try { student = JSON.parse(sessionStorage.getItem("student") || "null"); } catch (e) {}
+    if (!student || !student.name || !student.student_id) {
+      window.location.replace("/");
+    }
+
+    const form = document.getElementById("code-form");
+    const button = document.getElementById("submit");
+    const msg = document.getElementById("msg");
+    form.elements.code.focus();
+
+    // After "تم التحضير": back to an empty page 1.
+    document.getElementById("done-back").addEventListener("click", () => {
+      sessionStorage.removeItem("student");
+      window.location.href = "/";
+    });
+
+    // Back to page 1 with the data filled in, so the student can fix it.
+    document.getElementById("back").addEventListener("click", () => {
+      sessionStorage.setItem("editStudent", "1");
+      window.location.href = "/";
+    });
+
+    form.addEventListener("submit", async (e) => {
+      e.preventDefault();
+      clearMsg(msg);
+      const code = form.elements.code.value.trim();
+      if (!code) return showError(msg, "الكود مطلوب");
+
+      button.disabled = true;  // stop double taps
+      try {
+        const data = await api("POST", "/api/attend", { ...student, code });
+        msg.textContent = data.message;
+        msg.className = "msg ok";
+        form.elements.code.disabled = true;
+        button.disabled = true;
+        document.getElementById("back").classList.add("hidden");
+        document.getElementById("done-back").classList.remove("hidden");
+      } catch (err) {
+        showError(msg, err.message);
+        button.disabled = false;
+        form.elements.code.select();
+      }
+    });
+  </script>
+</body>
+</html>
